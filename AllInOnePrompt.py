@@ -1,9 +1,10 @@
 import torch
+import torchmetrics
 import torch.nn.functional as F
 from torch_geometric.data import Batch, Data
-# from deprecated.sphinx import deprecated
 from sklearn.cluster import KMeans
 from torch_geometric.nn.inits import glorot
+
 
 class LightPrompt(torch.nn.Module):
     def __init__(self, token_dim, token_num_per_group, group_num=1, inner_prune=None):
@@ -57,6 +58,7 @@ class LightPrompt(torch.nn.Module):
         pg_batch = Batch.from_data_list(pg_list)
         return pg_batch
 
+
 class HeavyPrompt(LightPrompt):
     def __init__(self, token_dim, token_num, cross_prune=0.1, inner_prune=0.01):
         super(HeavyPrompt, self).__init__(token_dim, token_num, 1, inner_prune)  # only has one prompt graph.
@@ -78,14 +80,14 @@ class HeavyPrompt(LightPrompt):
         re_graph_list = []
         for g in Batch.to_data_list(graph_batch):
             g_edge_index = g.edge_index + token_num
-            
+
             cross_dot = torch.mm(pg.x, torch.transpose(g.x, 0, 1))
             cross_sim = torch.sigmoid(cross_dot)  # 0-1 from prompt to input graph
             cross_adj = torch.where(cross_sim < self.cross_prune, 0, cross_sim)
-            
+
             cross_edge_index = cross_adj.nonzero().t().contiguous()
             cross_edge_index[1] = cross_edge_index[1] + token_num
-            
+
             x = torch.cat([pg.x, g.x], dim=0)
             y = g.y
 
@@ -95,11 +97,11 @@ class HeavyPrompt(LightPrompt):
 
         graphp_batch = Batch.from_data_list(re_graph_list)
         return graphp_batch
-    
 
     def Tune(self, train_loader, gnn, answering, lossfn, opi, device):
         running_loss = 0.
-        for batch_id, train_batch in enumerate(train_loader):  
+        for batch_id, train_batch in enumerate(train_loader):
+            opi.zero_grad()
             # print(train_batch)
             train_batch = train_batch.to(device)
             prompted_graph = self.forward(train_batch)
@@ -108,16 +110,16 @@ class HeavyPrompt(LightPrompt):
             graph_emb = gnn(prompted_graph.x, prompted_graph.edge_index, prompted_graph.batch)
             pre = answering(graph_emb)
             train_loss = lossfn(pre, train_batch.y)
-
-            opi.zero_grad()
             train_loss.backward()
             opi.step()
             running_loss += train_loss.item()
 
+            print(' batch {}/{} | loss: {:.8f}'.format(batch_id, len(train_loader), train_loss))
+
         return running_loss / len(train_loader)
-    
+
     def TuneWithoutAnswering(self, train_loader, gnn, answering, lossfn, opi, device):
-        total_loss = 0.0 
+        total_loss = 0.0
         for batch in train_loader:
             self.optimizer.zero_grad()
             batch = batch.to(self.device)
@@ -131,8 +133,9 @@ class HeavyPrompt(LightPrompt):
             loss = lossfn(sim, batch.y)
             loss.backward()
             self.optimizer.step()
-            total_loss += loss.item()  
-        return total_loss / len(train_loader) 
+            total_loss += loss.item()
+        return total_loss / len(train_loader)
+
 
 class FrontAndHead(torch.nn.Module):
     def __init__(self, input_dim, hid_dim=16, num_classes=2,
@@ -158,4 +161,60 @@ class FrontAndHead(torch.nn.Module):
 
         return pre
 
+def GNNNodeEva(data, idx_test,  gnn, answering, num_class, device):
+    gnn.eval()
+    accuracy = torchmetrics.classification.Accuracy(task="multiclass", num_classes=num_class).to(device)
+    macro_f1 = torchmetrics.classification.F1Score(task="multiclass", num_classes=num_class, average="macro").to(device)
+    auroc = torchmetrics.classification.AUROC(task="multiclass", num_classes=num_class).to(device)
+    auprc = torchmetrics.classification.AveragePrecision(task="multiclass", num_classes=num_class).to(device)
 
+    accuracy.reset()
+    macro_f1.reset()
+    auroc.reset()
+    auprc.reset()
+
+    out = gnn(data.x, data.edge_index, batch=None)
+    out = answering(out)
+    pred = out.argmax(dim=1)
+
+    acc = accuracy(pred[idx_test], data.y[idx_test])
+    f1 = macro_f1(pred[idx_test], data.y[idx_test])
+    roc = auroc(out[idx_test], data.y[idx_test])
+    prc = auprc(out[idx_test], data.y[idx_test])
+    return acc.item(), f1.item(), roc.item(), prc.item()
+
+def AllInOneEva(loader, prompt, gnn, answering, num_class, device):
+    prompt.eval()
+    answering.eval()
+
+    accuracy = torchmetrics.classification.Accuracy(task="multiclass", num_classes=num_class).to(device)
+    macro_f1 = torchmetrics.classification.F1Score(task="multiclass", num_classes=num_class, average="macro").to(device)
+    auroc = torchmetrics.classification.AUROC(task="multiclass", num_classes=num_class).to(device)
+    auprc = torchmetrics.classification.AveragePrecision(task="multiclass", num_classes=num_class).to(device)
+
+    accuracy.reset()
+    macro_f1.reset()
+    auroc.reset()
+    auprc.reset()
+
+    with torch.no_grad():
+        for batch_id, batch in enumerate(loader):
+            batch = batch.to(device)
+            prompted_graph = prompt(batch)
+            graph_emb = gnn(prompted_graph.x, prompted_graph.edge_index, prompted_graph.batch)
+            pre = answering(graph_emb)
+            pred = pre.argmax(dim=1)
+
+            acc = accuracy(pred, batch.y)
+            ma_f1 = macro_f1(pred, batch.y)
+            roc = auroc(pre, batch.y)
+            prc = auprc(pre, batch.y)
+            if len(loader) > 20:
+                print("Batch {}/{} Acc: {:.4f} | Macro-F1: {:.4f}| AUROC: {:.4f}| AUPRC: {:.4f}".format(batch_id,len(loader), acc.item(), ma_f1.item(),roc.item(), prc.item()))
+
+    acc = accuracy.compute()
+    ma_f1 = macro_f1.compute()
+    roc = auroc.compute()
+    prc = auprc.compute()
+
+    return acc.item(), ma_f1.item(), roc.item(), prc.item()

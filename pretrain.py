@@ -19,7 +19,7 @@ def get_args():
                         help='Input batch size for training (default: 32)')
     parser.add_argument('--epochs', type=int, default=1000,
                         help='Number of epochs to train (default: 50)')
-    parser.add_argument('--shot_num', type=int, default=100, help='Number of shots')
+    parser.add_argument('--shot_num', type=int, default=1, help='Number of shots')
     parser.add_argument('--pre_train_model_path', type=str, default='None',
                         help='add pre_train_model_path to the downstream task, the model is self-supervise model if the path is None and prompttype is None.')
     parser.add_argument('--lr', type=float, default=0.0001,
