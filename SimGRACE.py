@@ -123,7 +123,7 @@ class SimGRACE(torch.nn.Module):
             raise KeyError(
                 "batch_size {} makes the last batch only contain 1 graph, \n which will trigger a zero bug in SimGRACE!")
 
-        loader = DataLoader(graph_list, batch_size=batch_size, shuffle=False, num_workers=1)
+        loader = DataLoader(graph_list, batch_size=batch_size, shuffle=False, num_workers=4)
         return loader
 
     def forward_cl(self, x, edge_index, batch):

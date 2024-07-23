@@ -1,5 +1,6 @@
 import os
 import torch.nn.functional as F
+from ogb.nodeproppred import NodePropPredDataset
 from torch_geometric.datasets import Planetoid, Amazon, Reddit, WikiCS, Flickr
 from torch_geometric.transforms import NormalizeFeatures
 from torch_geometric.utils import subgraph, k_hop_subgraph
@@ -9,9 +10,11 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import scipy.io as sio
+from scipy.sparse import csr_matrix
 import random
 from sklearn import preprocessing
 from sklearn.metrics import f1_score
+import json
 
 def seed_everything(seed):
     random.seed(seed)
@@ -128,62 +131,163 @@ def split_induced_graphs(data, dir_path, device, smallest_size=10, largest_size=
         pickle.dump(saved_graph_list, f)
         print("induced graph data has been write into " + file_path)
 
+def load_npz_to_sparse_graph(file_name):
+    """Load a SparseGraph from a Numpy binary file.
+    Parameters
+    ----------
+    file_name : str
+        Name of the file to load.
+    Returns
+    -------
+    sparse_graph : SparseGraph
+        Graph in sparse matrix format.
+    """
+    with np.load(file_name) as loader:
+        loader = dict(loader)
+        adj_matrix = sp.csr_matrix((loader['adj_data'], loader['adj_indices'], loader['adj_indptr']),
+                                   shape=loader['adj_shape'])
+
+        if 'attr_data' in loader:
+            # Attributes are stored as a sparse CSR matrix
+            attr_matrix = sp.csr_matrix((loader['attr_data'], loader['attr_indices'], loader['attr_indptr']),
+                                        shape=loader['attr_shape'])
+        elif 'attr_matrix' in loader:
+            # Attributes are stored as a (dense) np.ndarray
+            attr_matrix = loader['attr_matrix']
+        else:
+            attr_matrix = None
+
+        if 'labels_data' in loader:
+            # Labels are stored as a CSR matrix
+            labels = sp.csr_matrix((loader['labels_data'], loader['labels_indices'], loader['labels_indptr']),
+                                   shape=loader['labels_shape'])
+        elif 'labels' in loader:
+            # Labels are stored as a numpy array
+            labels = loader['labels']
+        else:
+            labels = None
+
+        node_names = loader.get('node_names')
+        attr_names = loader.get('attr_names')
+        class_names = loader.get('class_names')
+        metadata = loader.get('metadata')
+
+    return adj_matrix, attr_matrix, labels, node_names, attr_names, class_names, metadata
+
 
 valid_num_dic = {'Amazon_clothing': 17, 'Amazon_eletronics': 36, 'dblp': 27}
 
 
 def load_data(dataset_source):
-    n1s = []
-    n2s = []
-    for line in open("data/{}_network".format(dataset_source)):
-        n1, n2 = line.strip().split('\t')
-        n1s.append(int(n1))
-        n2s.append(int(n2))
+    class_list_train, class_list_valid, class_list_test = json.load(
+        open('./data/{}_class_split.json'.format(dataset_source)))
+    if dataset_source in valid_num_dic.keys():
+        n1s = []
+        n2s = []
+        for line in open("data/{}_network".format(dataset_source)):
+            n1, n2 = line.strip().split('\t')
+            n1s.append(int(n1))
+            n2s.append(int(n2))
 
-    num_nodes = max(max(n1s), max(n2s)) + 1
-    adj = sp.coo_matrix((np.ones(len(n1s)), (n1s, n2s)),
-                        shape=(num_nodes, num_nodes))
+        num_nodes = max(max(n1s), max(n2s)) + 1
+        adj = sp.coo_matrix((np.ones(len(n1s)), (n1s, n2s)),
+                            shape=(num_nodes, num_nodes))
 
-    data_train = sio.loadmat("data/{}_train.mat".format(dataset_source))
-    train_class = list(set(data_train["Label"].reshape((1, len(data_train["Label"])))[0]))
+        data_train = sio.loadmat("data/{}_train.mat".format(dataset_source))
+        train_class = list(set(data_train["Label"].reshape((1, len(data_train["Label"])))[0]))
 
-    data_test = sio.loadmat("data/{}_test.mat".format(dataset_source))
-    class_list_test = list(set(data_test["Label"].reshape((1, len(data_test["Label"])))[0]))
+        data_test = sio.loadmat("data/{}_test.mat".format(dataset_source))
+        class_list_test = list(set(data_test["Label"].reshape((1, len(data_test["Label"])))[0]))
 
-    labels = np.zeros((num_nodes, 1))
-    labels[data_train['Index']] = data_train["Label"]
-    labels[data_test['Index']] = data_test["Label"]
+        labels = np.zeros((num_nodes, 1))
+        labels[data_train['Index']] = data_train["Label"]
+        labels[data_test['Index']] = data_test["Label"]
 
-    features = np.zeros((num_nodes, data_train["Attributes"].shape[1]))
-    features[data_train['Index']] = data_train["Attributes"].toarray()
-    features[data_test['Index']] = data_test["Attributes"].toarray()
+        features = np.zeros((num_nodes, data_train["Attributes"].shape[1]))
+        features[data_train['Index']] = data_train["Attributes"].toarray()
+        features[data_test['Index']] = data_test["Attributes"].toarray()
 
-    class_list = []
-    for cla in labels:
-        if cla[0] not in class_list:
-            class_list.append(cla[0])  # unsorted
+        class_list = []
+        for cla in labels:
+            if cla[0] not in class_list:
+                class_list.append(cla[0])  # unsorted
 
-    id_by_class = {}
-    for i in class_list:
-        id_by_class[i] = []
-    for id, cla in enumerate(labels):
-        id_by_class[cla[0]].append(id)
+        id_by_class = {}
+        for i in class_list:
+            id_by_class[i] = []
+        for id, cla in enumerate(labels):
+            id_by_class[cla[0]].append(id)
 
-    lb = preprocessing.LabelBinarizer()
-    labels = lb.fit_transform(labels)
+        lb = preprocessing.LabelBinarizer()
+        labels = lb.fit_transform(labels)
 
-    degree = np.sum(adj, axis=1)
-    degree = torch.FloatTensor(degree)
+        degree = np.sum(adj, axis=1)
+        degree = torch.FloatTensor(degree)
 
-    adj = normalize_adj(adj + sp.eye(adj.shape[0]))
-    features = torch.FloatTensor(features)
-    labels = torch.LongTensor(np.where(labels)[1])
+        adj = normalize_adj(adj + sp.eye(adj.shape[0]))
+        adj = sparse_mx_to_torch_csr_tensor(adj)
+        features = torch.FloatTensor(features)
+        labels = torch.LongTensor(np.where(labels)[1])
 
-    adj = sparse_mx_to_torch_sparse_tensor(adj)
+    elif dataset_source=='cora-full':
+        adj, features, labels, node_names, attr_names, class_names, metadata=load_npz_to_sparse_graph('./data/cora_full.npz')
 
-    class_list_valid = random.sample(train_class, valid_num_dic[dataset_source])
+        sparse_mx = adj.tocoo().astype(np.float32)
+        indices =np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64)
 
-    class_list_train = list(set(train_class).difference(set(class_list_valid)))
+        n1s=indices[0].tolist()
+        n2s=indices[1].tolist()
+
+        degree = np.sum(adj, axis=1)
+        degree = torch.FloatTensor(degree)
+
+        adj = normalize(adj.tocoo() + sp.eye(adj.shape[0]))
+        adj= sparse_mx_to_torch_csr_tensor(adj)
+        features=features.todense()
+        features = torch.FloatTensor(features)
+        labels=torch.LongTensor(labels).squeeze()
+
+
+        class_list =  class_list_train+class_list_valid+class_list_test
+
+        id_by_class = {}
+        for i in class_list:
+            id_by_class[i] = []
+        for id, cla in enumerate(labels.numpy().tolist()):
+            id_by_class[cla].append(id)
+
+    elif dataset_source=='ogbn-arxiv':
+
+        dataset = NodePropPredDataset(name = dataset_source)
+
+        split_idx = dataset.get_idx_split()
+        train_idx, valid_idx, test_idx = split_idx["train"], split_idx["valid"], split_idx["test"]
+        graph, labels = dataset[0] # graph: library-agnostic graph object
+
+        n1s=graph['edge_index'][0]
+        n2s=graph['edge_index'][1]
+
+        num_nodes = graph['num_nodes']
+        print('nodes num',num_nodes)
+        adj = sp.coo_matrix((np.ones(len(n1s)), (n1s, n2s)),
+                                shape=(num_nodes, num_nodes))
+        degree = np.sum(adj, axis=1)
+        degree = torch.FloatTensor(degree)
+        adj = normalize(adj + sp.eye(adj.shape[0]))
+        adj = sparse_mx_to_torch_csr_tensor(adj)
+
+        features=torch.FloatTensor(graph['node_feat'])
+        labels=torch.LongTensor(labels).squeeze()
+
+
+        class_list =  class_list_train+class_list_valid+class_list_test
+
+        id_by_class = {}
+        for i in class_list:
+            id_by_class[i] = []
+        for id, cla in enumerate(labels.numpy().tolist()):
+            id_by_class[cla].append(id)
+
 
     return adj, features, labels, degree, class_list_train, class_list_valid, class_list_test, id_by_class
 
@@ -221,14 +325,31 @@ def f1(output, labels):
     return f1
 
 
-def sparse_mx_to_torch_sparse_tensor(sparse_mx):
-    """Convert a scipy sparse matrix to a torch sparse tensor."""
+def sparse_mx_to_torch_coo_tensor(sparse_mx):
+    """Convert a scipy sparse matrix to a torch COO tensor."""
     sparse_mx = sparse_mx.tocoo().astype(np.float32)
     indices = torch.from_numpy(
         np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
     values = torch.from_numpy(sparse_mx.data)
     shape = torch.Size(sparse_mx.shape)
     return torch.sparse_coo_tensor(indices, values, shape)
+
+
+def sparse_mx_to_torch_csr_tensor(sparse_mx):
+    """Convert a scipy sparse matrix to a torch sparse CSR tensor."""
+    # Ensure the input is in CSR format
+    sparse_mx = csr_matrix(sparse_mx)
+
+    # Get the CSR format data
+    crow_indices = torch.from_numpy(sparse_mx.indptr).to(dtype=torch.int32)
+    col_indices = torch.from_numpy(sparse_mx.indices).to(dtype=torch.int32)
+    values = torch.from_numpy(sparse_mx.data).to(dtype=torch.float32)
+
+    # Get the shape of the matrix
+    shape = torch.Size(sparse_mx.shape)
+
+    # Create a torch sparse CSR tensor
+    return torch.sparse_csr_tensor(crow_indices, col_indices, values, shape)
 
 
 def task_generator(id_by_class, class_list, n_way, k_shot, m_query):

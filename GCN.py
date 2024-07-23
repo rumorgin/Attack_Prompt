@@ -4,10 +4,9 @@ import torch.nn.functional as F
 import sklearn.linear_model as lm
 import sklearn.metrics as skm
 import torch, gc
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import GCNConv, GATConv, GINConv, SAGEConv, SGConv
 from torch_geometric.utils import add_self_loops
-from torch_geometric.nn import global_add_pool, global_max_pool, GlobalAttention
-from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.nn import global_add_pool, global_max_pool, global_mean_pool, GlobalAttention
 import numpy as np
 import sklearn.linear_model as lm
 import sklearn.metrics as skm
@@ -90,3 +89,56 @@ class GCN(torch.nn.Module):
     def decode_all(self, z):
         prob_adj = z @ z.t()
         return (prob_adj > 0).nonzero(as_tuple=False).t()
+
+class Encoder(nn.Module):
+    def __init__(self, in_channels, hidden_channels, pool='mean', encoder_type='GCN'):
+        super(Encoder, self).__init__()
+        self.hidden_channels = hidden_channels
+        if encoder_type=='GCN':
+            self.conv1 = GCNConv(in_channels, self.hidden_channels)
+        elif encoder_type=='GAT':
+            self.conv1 = GATConv(in_channels, self.hidden_channels)
+        elif encoder_type=='GraphSAGE':
+            self.conv1 = SAGEConv(in_channels, self.hidden_channels)
+        elif encoder_type=='SGC':
+            self.conv1 = SGConv(in_channels, self.hidden_channels)
+        elif encoder_type=='GIN':
+            self.mlp1 = nn.Linear(in_channels, self.hidden_channels)
+            self.conv1 = GINConv(self.mlp1)
+
+        self.prelu1 = nn.PReLU(self.hidden_channels)
+        # Different kind of graph pooling
+        if pool == "sum":
+            self.pool = global_add_pool
+        elif pool == "mean":
+            self.pool = global_mean_pool
+        elif pool == "max":
+            self.pool = global_max_pool
+        # elif pool == "attention":
+        #     self.pool = GlobalAttention(gate_nn=torch.nn.Linear(emb_dim, 1))
+        else:
+            raise ValueError("Invalid graph pooling type.")
+
+
+    def forward(self, x, edge_index, batch=None):
+
+
+        x1 = self.conv1(x, edge_index)
+        x1 = self.prelu1(x1)
+        # x1 = F.normalize(x1)
+        if batch == None:
+            return x1
+        else:
+            x1 = self.pool(x1, batch.long())
+            return x1
+
+class Projector(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(Projector, self).__init__()
+        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
+        # self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.normalize(x)
+        return x
