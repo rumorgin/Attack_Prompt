@@ -75,12 +75,14 @@ class GCN(torch.nn.Module):
             node_emb = torch.sum(torch.cat(h_list[1:], dim=0), dim=0)[0]
         
         if batch == None:
+            node_emb = F.normalize(node_emb)
             return node_emb
         else:
             if prompt_type == 'Gprompt':
                 node_emb = prompt(node_emb)
-            graph_emb = self.pool(node_emb, batch.long())
-            return graph_emb
+            node_emb = self.pool(node_emb, batch.long())
+            node_emb = F.normalize(node_emb)
+            return node_emb
 
 
     def decode(self, z, edge_label_index):
@@ -125,7 +127,7 @@ class Encoder(nn.Module):
 
         x1 = self.conv1(x, edge_index)
         x1 = self.prelu1(x1)
-        # x1 = F.normalize(x1)
+        x1 = F.normalize(x1)
         if batch == None:
             return x1
         else:

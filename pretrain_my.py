@@ -3,7 +3,8 @@ import torch
 import torch.optim as optim
 from torch.autograd import Variable
 from torch_geometric.loader import DataLoader
-from torch_geometric.datasets import TUDataset,Planetoid, Amazon, Reddit, WikiCS, Flickr, CoraFull
+from torch_geometric.utils import from_scipy_sparse_matrix
+from torch_geometric.datasets import TUDataset,Planetoid, Amazon, Reddit, WikiCS, Flickr, CoraFull, DBLP
 from torch_geometric.transforms import NormalizeFeatures
 from torch_geometric.utils import to_undirected
 from torch_geometric.loader.cluster import ClusterData
@@ -15,20 +16,21 @@ from GCN import GCN, Encoder
 from GraphSAGE import GraphSAGE
 from torch.optim import Adam
 import os
+import json
 from utils import *
 
 def get_args():
     parser = argparse.ArgumentParser(description='PyTorch implementation of pre-training of graph neural networks')
     parser.add_argument('--task', type=str)
-    parser.add_argument('--dataset_name', type=str, default='Cora_full',
-                        help='Choose the dataset of pretrainor downstream task')
+    parser.add_argument('--dataset_name', type=str, default='cora-full',
+                        help='Choose the dataset of pretrainor downstream task, option: dblp, Cora_full')
     parser.add_argument('--device', type=int, default=0,
                         help='Which gpu to use if any (default: 0)')
     parser.add_argument('--gnn_type', type=str, default="GCN",
                         help='We support gnn like \GCN\ \GAT\ \GT\ \GCov\ \GIN\ \GraphSAGE\, please read ProG.model module')
     parser.add_argument('--prompt_type', type=str, default="All-in-one",
                         help='Choose the prompt type for node or graph task, for node task,we support \GPPT\, \All-in-one\, \Gprompt\ for graph task , \All-in-one\, \Gprompt\, \GPF\, \GPF-plus\ ')
-    parser.add_argument('--hid_dim', type=int, default=64,
+    parser.add_argument('--hid_dim', type=int, default=128,
                         help='hideen layer of GNN dimensions (default: 300)')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Input batch size for training (default: 32)')
@@ -41,7 +43,7 @@ def get_args():
                         help='Learning rate (default: 0.0001)')
     parser.add_argument('--decay', type=float, default=0.0001,
                         help='Weight decay (default: 0)')
-    parser.add_argument('--num_layer', type=int, default=3,
+    parser.add_argument('--num_layer', type=int, default=2,
                         help='Number of GNN message passing layers (default: 3).')
 
     parser.add_argument('--dropout_ratio', type=float, default=0.5,
@@ -94,33 +96,13 @@ class SimGRACE(torch.nn.Module):
 
     def load_graph_data(self):
 
-        dataset = CoraFull(root='./data/Planetoid', transform=NormalizeFeatures())
-        # Get the labels
-        labels = dataset[0].y
+        data, class_list_train, class_list_valid, class_list_test, id_by_class = load_data(self.dataset_name)
+        x = data.x.detach()
+        edge_index = data.edge_index
+        edge_index = to_undirected(edge_index)
+        data = Data(x=x, edge_index=edge_index)
 
-        # Define the label splits
-        train_labels = [3, 8, 17, 20, 21, 24, 25, 26, 28, 32, 35, 36, 37, 38, 40, 42, 44, 47, 52, 55, 57, 62, 63, 67,
-                        69]
-        valid_labels = [2, 51, 48, 27, 13, 54, 46, 64, 16, 68, 6, 31, 60, 33, 65, 43, 23, 19, 18, 34]
-        test_labels = [56, 14, 0, 11, 4, 10, 12, 49, 22, 15, 1, 59, 50, 58, 61, 41, 39, 30, 53, 29, 9, 5, 66, 45, 7]
-
-        # Create masks for training, validation, and test sets
-        train_mask = torch.isin(labels, torch.tensor(train_labels))
-        valid_mask = torch.isin(labels, torch.tensor(valid_labels))
-        test_mask = torch.isin(labels, torch.tensor(test_labels))
-
-        # Apply the masks to the dataset
-        data = dataset[0]
-        data.train_mask = train_mask
-        data.val_mask = valid_mask
-        data.test_mask = test_mask
-
-        # Extract only the training nodes and their edges
-        train_data = data.subgraph(data.train_mask)
-
-        # Create ClusterData object for the training data
-        self.graph_list = ClusterData(train_data, num_parts=200, recursive=False)
-
+        self.graph_list = list(ClusterData(data=data, num_parts=200))
         self.input_dim = data.x.shape[1]
 
 

@@ -1,11 +1,12 @@
 import os
 import torch.nn.functional as F
 from ogb.nodeproppred import NodePropPredDataset
-from torch_geometric.datasets import Planetoid, Amazon, Reddit, WikiCS, Flickr
+from torch_geometric.datasets import Planetoid, Amazon, Reddit, WikiCS, Flickr, CoraFull
 from torch_geometric.transforms import NormalizeFeatures
 from torch_geometric.utils import subgraph, k_hop_subgraph
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 import pickle
+from copy import deepcopy
 import numpy as np
 import scipy.sparse as sp
 import torch
@@ -78,22 +79,21 @@ def load4node(dataname):
     return data, input_dim, out_dim
 
 
-def split_induced_graphs(data, dir_path, device, smallest_size=10, largest_size=30):
+def split_induced_graphs(data, index, device, smallest_size=10, largest_size=30):
     induced_graph_list = []
-    saved_graph_list = []
     from copy import deepcopy
 
-    for index in range(data.x.size(0)):
-        current_label = data.y[index].item()
+    for i in index:
+        current_label = data.y[i].item()
 
         current_hop = 2
-        subset, _, _, _ = k_hop_subgraph(node_idx=index, num_hops=current_hop,
+        subset, _, _, _ = k_hop_subgraph(node_idx=i, num_hops=current_hop,
                                          edge_index=data.edge_index, relabel_nodes=True)
         subset = subset
 
         while len(subset) < smallest_size and current_hop < 5:
             current_hop += 1
-            subset, _, _, _ = k_hop_subgraph(node_idx=index, num_hops=current_hop,
+            subset, _, _, _ = k_hop_subgraph(node_idx=i, num_hops=current_hop,
                                              edge_index=data.edge_index)
 
         if len(subset) < smallest_size:
@@ -107,7 +107,7 @@ def split_induced_graphs(data, dir_path, device, smallest_size=10, largest_size=
 
         if len(subset) > largest_size:
             subset = subset[torch.randperm(subset.shape[0])][0:largest_size - 1]
-            subset = torch.unique(torch.cat([torch.LongTensor([index]).to(device), torch.flatten(subset)]))
+            subset = torch.unique(torch.cat([torch.LongTensor([i]).to(device), torch.flatten(subset)]))
 
         subset = subset.to(device)
         sub_edge_index, _ = subgraph(subset, data.edge_index, relabel_nodes=True)
@@ -115,21 +115,29 @@ def split_induced_graphs(data, dir_path, device, smallest_size=10, largest_size=
 
         x = data.x[subset]
 
-        induced_graph = Data(x=x, edge_index=sub_edge_index, y=current_label, index=index)
-        saved_graph_list.append(deepcopy(induced_graph).to('cpu'))
+        induced_graph = Data(x=x, edge_index=sub_edge_index, y=current_label, index=i)
         induced_graph_list.append(induced_graph)
-        if index % 500 == 0:
-            print(index)
+    return Batch.from_data_list(induced_graph_list)
 
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
 
-    file_path = os.path.join(dir_path, 'induced_graph_min' + str(smallest_size) + '_max' + str(largest_size) + '.pkl')
-    with open(file_path, 'wb') as f:
-        # Assuming 'data' is what you want to pickle
-        # pickle.dump(induced_graph_list, f)
-        pickle.dump(saved_graph_list, f)
-        print("induced graph data has been write into " + file_path)
+def load_induced_graph(dataset_name, data, device):
+    folder_path = './Experiment/induced_graph/' + dataset_name
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+
+    file_path = folder_path + '/induced_graph.pkl'
+    if os.path.exists(file_path):
+        with open(file_path, 'rb') as f:
+            print('loading induced graph...')
+            graphs_list = pickle.load(f)
+            print('Done!!!')
+    else:
+        print('Begin split_induced_graphs.')
+        split_induced_graphs(data, folder_path, device, smallest_size=10, largest_size=30)
+        with open(file_path, 'rb') as f:
+            graphs_list = pickle.load(f)
+    graphs_list = [graph.to(device) for graph in graphs_list]
+    return graphs_list
 
 def load_npz_to_sparse_graph(file_name):
     """Load a SparseGraph from a Numpy binary file.
@@ -179,25 +187,25 @@ valid_num_dic = {'Amazon_clothing': 17, 'Amazon_eletronics': 36, 'dblp': 27}
 
 
 def load_data(dataset_source):
-    class_list_train, class_list_valid, class_list_test = json.load(
-        open('./data/{}_class_split.json'.format(dataset_source)))
+    # Load the class splits
+    with open(f'./data/{dataset_source}_class_split.json', 'r') as f:
+        class_list_train, class_list_valid, class_list_test = json.load(f)
     if dataset_source in valid_num_dic.keys():
+        # Load the network (adjacency matrix)
         n1s = []
         n2s = []
-        for line in open("data/{}_network".format(dataset_source)):
-            n1, n2 = line.strip().split('\t')
-            n1s.append(int(n1))
-            n2s.append(int(n2))
+        with open(f"data/{dataset_source}_network", 'r') as f:
+            for line in f:
+                n1, n2 = line.strip().split('\t')
+                n1s.append(int(n1))
+                n2s.append(int(n2))
 
         num_nodes = max(max(n1s), max(n2s)) + 1
-        adj = sp.coo_matrix((np.ones(len(n1s)), (n1s, n2s)),
-                            shape=(num_nodes, num_nodes))
+        adj = sp.coo_matrix((np.ones(len(n1s)), (n1s, n2s)), shape=(num_nodes, num_nodes))
 
-        data_train = sio.loadmat("data/{}_train.mat".format(dataset_source))
-        train_class = list(set(data_train["Label"].reshape((1, len(data_train["Label"])))[0]))
-
-        data_test = sio.loadmat("data/{}_test.mat".format(dataset_source))
-        class_list_test = list(set(data_test["Label"].reshape((1, len(data_test["Label"])))[0]))
+        # Load the train and test data
+        data_train = sio.loadmat(f"data/{dataset_source}_train.mat")
+        data_test = sio.loadmat(f"data/{dataset_source}_test.mat")
 
         labels = np.zeros((num_nodes, 1))
         labels[data_train['Index']] = data_train["Label"]
@@ -207,53 +215,32 @@ def load_data(dataset_source):
         features[data_train['Index']] = data_train["Attributes"].toarray()
         features[data_test['Index']] = data_test["Attributes"].toarray()
 
-        class_list = []
-        for cla in labels:
-            if cla[0] not in class_list:
-                class_list.append(cla[0])  # unsorted
+        # Convert to PyG format
+        row, col = adj.nonzero()
+        edge_index = torch.tensor(np.vstack((row, col)), dtype=torch.long)
+        features = torch.tensor(features, dtype=torch.float)
+        labels = torch.tensor(labels, dtype=torch.long).view(-1)
 
-        id_by_class = {}
-        for i in class_list:
-            id_by_class[i] = []
-        for id, cla in enumerate(labels):
-            id_by_class[cla[0]].append(id)
+        # Create PyG Data object
+        data = Data(x=features, edge_index=edge_index, y=labels)
 
-        lb = preprocessing.LabelBinarizer()
-        labels = lb.fit_transform(labels)
+        # Additional data structure for class-based indexing
+        class_list = class_list_train + class_list_valid + class_list_test
+        id_by_class = {i: [] for i in class_list}
 
-        degree = np.sum(adj, axis=1)
-        degree = torch.FloatTensor(degree)
+        for id, cla in enumerate(labels.tolist()):
+            if cla in id_by_class:  # Ensure only known classes are considered
+                id_by_class[cla].append(id)
 
-        adj = normalize_adj(adj + sp.eye(adj.shape[0]))
-        adj = sparse_mx_to_torch_csr_tensor(adj)
-        features = torch.FloatTensor(features)
-        labels = torch.LongTensor(np.where(labels)[1])
 
     elif dataset_source=='cora-full':
-        adj, features, labels, node_names, attr_names, class_names, metadata=load_npz_to_sparse_graph('./data/cora_full.npz')
-
-        sparse_mx = adj.tocoo().astype(np.float32)
-        indices =np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64)
-
-        n1s=indices[0].tolist()
-        n2s=indices[1].tolist()
-
-        degree = np.sum(adj, axis=1)
-        degree = torch.FloatTensor(degree)
-
-        adj = normalize(adj.tocoo() + sp.eye(adj.shape[0]))
-        adj= sparse_mx_to_torch_csr_tensor(adj)
-        features=features.todense()
-        features = torch.FloatTensor(features)
-        labels=torch.LongTensor(labels).squeeze()
-
-
+        data = CoraFull(root='./data/Planetoid', transform=NormalizeFeatures())
         class_list =  class_list_train+class_list_valid+class_list_test
 
         id_by_class = {}
         for i in class_list:
             id_by_class[i] = []
-        for id, cla in enumerate(labels.numpy().tolist()):
+        for id, cla in enumerate(data.y.tolist()):
             id_by_class[cla].append(id)
 
     elif dataset_source=='ogbn-arxiv':
@@ -289,7 +276,7 @@ def load_data(dataset_source):
             id_by_class[cla].append(id)
 
 
-    return adj, features, labels, degree, class_list_train, class_list_valid, class_list_test, id_by_class
+    return data, class_list_train, class_list_valid, class_list_test, id_by_class
 
 
 def normalize(mx):
@@ -362,7 +349,7 @@ def task_generator(id_by_class, class_list, n_way, k_shot, m_query):
         id_support.extend(temp[:k_shot])
         id_query.extend(temp[k_shot:])
 
-    return np.array(id_support), np.array(id_query), class_selected
+    return id_support, id_query, class_selected
 
 
 def euclidean_dist(x, y):

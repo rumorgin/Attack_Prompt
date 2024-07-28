@@ -1,80 +1,12 @@
-import time
 import argparse
-import numpy as np
+import time
 
-import torch
 import torch.optim as optim
 
-from utils import *
+from AllInOnePrompt import HeavyPrompt
+from GCN import GCN
 from GPN import *
-from GCN import GCN, Encoder, Projector
-
-
-
-def train(class_selected, id_support, id_query, n_way, k_shot):
-    # Fine-tuning loop
-    encoder.train()  # Set GCN model to evaluation mode
-
-    optimizer_encoder.zero_grad()
-    embeddings = encoder(features, adj)
-    z_dim = embeddings.size()[1]
-
-    # embedding lookup
-    support_embeddings = embeddings[id_support]
-    support_embeddings = support_embeddings.view([n_way, k_shot, z_dim])
-    query_embeddings = embeddings[id_query]
-
-    # compute loss
-    prototype_embeddings = support_embeddings.sum(1)
-    dists = euclidean_dist(query_embeddings, prototype_embeddings)
-    output = F.log_softmax(-dists, dim=1)
-
-    labels_new = torch.LongTensor([class_selected.index(i) for i in labels[id_query]])
-    if args.cuda:
-        labels_new = labels_new.cuda()
-    loss_train = F.nll_loss(output, labels_new)
-
-    loss_train.backward()
-    optimizer_encoder.step()
-    # optimizer_scorer.step()
-
-    if args.cuda:
-        output = output.cpu().detach()
-        labels_new = labels_new.cpu().detach()
-    acc_train = accuracy(output, labels_new)
-    f1_train = f1(output, labels_new)
-
-    return acc_train, f1_train, loss_train.item()
-
-
-def test(class_selected, id_support, id_query, n_way, k_shot):
-    encoder.eval()
-    embeddings = encoder(features, adj)
-    z_dim = embeddings.size()[1]
-
-    # embedding lookup
-    support_embeddings = embeddings[id_support]
-    support_embeddings = support_embeddings.view([n_way, k_shot, z_dim])
-    query_embeddings = embeddings[id_query]
-
-    # compute loss
-    prototype_embeddings = support_embeddings.sum(1)
-    dists = euclidean_dist(query_embeddings, prototype_embeddings)
-    output = F.log_softmax(-dists, dim=1)
-
-    labels_new = torch.LongTensor([class_selected.index(i) for i in labels[id_query]])
-    if args.cuda:
-        labels_new = labels_new.cuda()
-    loss_test = F.nll_loss(output, labels_new)
-
-    if args.cuda:
-        output = output.cpu().detach()
-        labels_new = labels_new.cpu().detach()
-    acc_test = accuracy(output, labels_new)
-    f1_test = f1(output, labels_new)
-
-    return acc_test, f1_test
-
+from utils import *
 
 if __name__ == '__main__':
     # Training settings
@@ -83,7 +15,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=1234, help='Random seed.')
     parser.add_argument('--episodes', type=int, default=1000,
                         help='Number of episodes to train.')
-    parser.add_argument('--lr', type=float, default=0.005,
+    parser.add_argument('--lr', type=float, default=0.001,
                         help='Initial learning rate, default is 0.005.')
     parser.add_argument('--weight_decay', type=float, default=5e-4,
                         help='Weight decay (L2 loss on parameters).')
@@ -94,32 +26,47 @@ if __name__ == '__main__':
 
     parser.add_argument('--way', type=int, default=5, help='way.')
     parser.add_argument('--shot', type=int, default=5, help='shot.')
-    parser.add_argument('--qry', type=int, help='k shot for query set', default=20)
-    parser.add_argument('--dataset', default='dblp',
+    parser.add_argument('--qry', type=int, help='k shot for query set', default=10)
+    parser.add_argument('--dataset', default='cora-full',
                         help='Dataset:Amazon_clothing/Amazon_eletronics/dblp/cora-full')
+    parser.add_argument('--pretrain', type=bool, default=True, help='copy the pretrained model parameters or not')
 
     args = parser.parse_args()
-    args.cuda = args.use_cuda and torch.cuda.is_available()
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if args.cuda:
+    if args.use_cuda:
         torch.cuda.manual_seed(args.seed)
+        device = torch.device("cuda:0")
 
     # Load data
     dataset = args.dataset
-    adj, features, labels, degrees, class_list_train, class_list_valid, class_list_test, id_by_class = load_data(
+    data, class_list_train, class_list_valid, class_list_test, id_by_class = load_data(
         dataset)
 
-    encoder = Encoder(in_channels=features.shape[1], hidden_channels=args.hidden)
-    # encoder = GCN(input_dim=features.shape[1], hid_dim=args.hidden, out_dim=None, num_layer=3,JK="last", drop_ratio=0, pool='mean')
+    data = data.to(device)
 
+    # graphs_list = load_induced_graph(args.dataset, data, device='cuda:0')
 
-    # encoder.load_state_dict(torch.load('./pre_trained_gnn/Cora_full/SimGRACE.GCN.64hidden_dim.pth', map_location='cuda:0'))
-    # print("Successfully loaded pre-trained weights!")
+    # encoder = Encoder(in_channels=features.shape[1], hidden_channels=args.hidden)
+    encoder = GCN(input_dim=data.x.shape[1], hid_dim=args.hidden, out_dim=None, num_layer=2, JK="last", drop_ratio=0,
+                  pool='mean').to(device)
+    if args.pretrain:
+        if args.dataset == 'cora-full':
+            encoder.load_state_dict(
+                torch.load('./pre_trained_gnn/cora-full/SimGRACE.GCN.128hidden_dim.pth', map_location='cuda:0'))
+            print("Successfully loaded pre-trained weights!")
+
+    answering = torch.nn.Sequential(torch.nn.Linear(args.hidden, data.num_classes),
+                                    torch.nn.Softmax(dim=1)).to(device)
+
+    prompt = HeavyPrompt(token_dim=data.num_features, token_num=10, cross_prune=0.1, inner_prune=0.3).to(device)
+
 
     optimizer_encoder = optim.Adam(encoder.parameters(),
                                    lr=args.lr, weight_decay=args.weight_decay)
+    optimizer_prompt = optim.Adam(prompt.parameters(), lr=1e-6, weight_decay=args.weight_decay)
+    optimizer_answering = optim.Adam(answering.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     n_way = args.way
     k_shot = args.shot
@@ -134,46 +81,108 @@ if __name__ == '__main__':
     # Train model
     t_total = time.time()
     meta_train_acc = []
-    meta_train_loss=[]
+    meta_train_loss = []
     # Initialize variables to store the best accuracy and F1 score
     best_test_acc = 0.0
     best_test_f1 = 0.0
-    best_epoch=0
-
-    if args.cuda:
-        encoder.cuda()
-        features = features.cuda()
-        adj = adj.cuda()
-        labels = labels.cuda()
-        degrees = degrees.cuda()
+    best_epoch = 0
 
     for episode in range(args.episodes):
+
         id_support, id_query, class_selected = \
             task_generator(id_by_class, class_list_train, n_way, k_shot, n_query)
-        acc_train, f1_train, loss_train = train(class_selected, id_support, id_query, n_way, k_shot)
+
+        support_induced_graph = split_induced_graphs(data,id_support, device, smallest_size=10, largest_size=30)
+
+        query_induced_graph = split_induced_graphs(data,id_query, device, smallest_size=10, largest_size=30)
+
+        # answering.train()
+        encoder.train()
+
+        optimizer_encoder.zero_grad()
+        optimizer_answering.zero_grad()
+
+        support_embeddings = encoder(support_induced_graph.x, support_induced_graph.edge_index, support_induced_graph.batch)
+        z_dim = support_embeddings.size()[1]
+        support_embeddings = support_embeddings.view([n_way, k_shot, z_dim])
+
+        query_embeddings = encoder(query_induced_graph.x, query_induced_graph.edge_index,query_induced_graph.batch)
+
+        # compute loss
+        prototype_embeddings = support_embeddings.sum(1)
+        dists = euclidean_dist(query_embeddings, prototype_embeddings)
+        output = F.log_softmax(-dists, dim=1)
+
+        labels_new = torch.LongTensor([class_selected.index(i) for i in data.y[id_query]])
+        if args.use_cuda:
+            labels_new = labels_new.cuda()
+        loss_train = F.nll_loss(output, labels_new)
+
+        loss_train.backward()
+        optimizer_encoder.step()
+
+        if args.use_cuda:
+            output = output.cpu().detach()
+            labels_new = labels_new.cpu().detach()
+        acc_train = accuracy(output, labels_new)
+        f1_train = f1(output, labels_new)
         meta_train_acc.append(acc_train)
-        meta_train_loss.append(loss_train)
+        meta_train_loss.append(loss_train.cpu().detach())
         if episode > 0 and episode % 10 == 0:
             print("-------Episode {}-------".format(episode))
             print("Meta-Train_Accuracy: {}  Meta-Train_Loss: {}".format(np.array(meta_train_acc).mean(axis=0),
                                                                         np.array(meta_train_loss).mean(axis=0)))
 
-            # validation
-            meta_test_acc = []
-            meta_test_f1 = []
-            for idx in range(meta_valid_num):
-                id_support, id_query, class_selected = valid_pool[idx]
-                acc_test, f1_test = test(class_selected, id_support, id_query, n_way, k_shot)
-                meta_test_acc.append(acc_test)
-                meta_test_f1.append(f1_test)
-            print("Meta-valid_Accuracy: {}, Meta-valid_F1: {}".format(np.array(meta_test_acc).mean(axis=0),
-                                                                        np.array(meta_test_f1).mean(axis=0)))
+            # # validation
+            # meta_test_acc = []
+            # meta_test_f1 = []
+            # for idx in range(meta_valid_num):
+            #     id_support, id_query, class_selected = valid_pool[idx]
+            #     acc_test, f1_test = test(class_selected, id_support, id_query, n_way, k_shot)
+            #     meta_test_acc.append(acc_test)
+            #     meta_test_f1.append(f1_test)
+            # print("Meta-valid_Accuracy: {}, Meta-valid_F1: {}".format(np.array(meta_test_acc).mean(axis=0),
+            #                                                             np.array(meta_test_f1).mean(axis=0)))
             # testing
             meta_test_acc = []
             meta_test_f1 = []
             for idx in range(meta_test_num):
                 id_support, id_query, class_selected = test_pool[idx]
-                acc_test, f1_test = test(class_selected, id_support, id_query, n_way, k_shot)
+
+                support_induced_graph = split_induced_graphs(data, id_support, device, smallest_size=10,
+                                                             largest_size=30)
+
+                query_induced_graph = split_induced_graphs(data, id_query, device, smallest_size=10, largest_size=30)
+
+                # answering.train()
+                encoder.eval()
+
+                optimizer_encoder.zero_grad()
+                optimizer_answering.zero_grad()
+
+                support_embeddings = encoder(support_induced_graph.x, support_induced_graph.edge_index,
+                                             support_induced_graph.batch)
+                z_dim = support_embeddings.size()[1]
+                support_embeddings = support_embeddings.view([n_way, k_shot, z_dim])
+
+                query_embeddings = encoder(query_induced_graph.x, query_induced_graph.edge_index,
+                                           query_induced_graph.batch)
+
+                # compute loss
+                prototype_embeddings = support_embeddings.sum(1)
+                dists = euclidean_dist(query_embeddings, prototype_embeddings)
+                output = F.log_softmax(-dists, dim=1)
+
+                labels_new = torch.LongTensor([class_selected.index(i) for i in data.y[id_query]])
+                if args.use_cuda:
+                    labels_new = labels_new.cuda()
+                loss_test = F.nll_loss(output, labels_new)
+
+                if args.use_cuda:
+                    output = output.cpu().detach()
+                    labels_new = labels_new.cpu().detach()
+                acc_test = accuracy(output, labels_new)
+                f1_test = f1(output, labels_new)
                 meta_test_acc.append(acc_test)
                 meta_test_f1.append(f1_test)
 
@@ -181,12 +190,12 @@ if __name__ == '__main__':
             mean_test_acc = np.array(meta_test_acc).mean(axis=0)
             mean_test_f1 = np.array(meta_test_f1).mean(axis=0)
             print("Meta-Test_Accuracy: {}, Meta-Test_F1: {}".format(np.array(meta_test_acc).mean(axis=0),
-                                                                        np.array(meta_test_f1).mean(axis=0)))
+                                                                    np.array(meta_test_f1).mean(axis=0)))
 
             # Update the best test results if the current results are better
             if mean_test_acc > best_test_acc:
                 best_test_acc = mean_test_acc
-                best_epoch=episode
+                best_epoch = episode
                 best_test_f1 = mean_test_f1
 
     # After the loop, print the best test results
