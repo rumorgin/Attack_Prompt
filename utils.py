@@ -79,65 +79,58 @@ def load4node(dataname):
     return data, input_dim, out_dim
 
 
-def split_induced_graphs(data, index, device, smallest_size=10, largest_size=30):
-    induced_graph_list = []
-    from copy import deepcopy
+def split_induced_graphs(data, dir_path, device, smallest_size=10, largest_size=30):
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
 
-    for i in index:
-        current_label = data.y[i].item()
-
+    for index in range(data.x.size(0)):
+        current_label = data.y[index].item()
         current_hop = 2
-        subset, _, _, _ = k_hop_subgraph(node_idx=i, num_hops=current_hop,
+        subset, _, _, _ = k_hop_subgraph(node_idx=index, num_hops=current_hop,
                                          edge_index=data.edge_index, relabel_nodes=True)
-        subset = subset
 
         while len(subset) < smallest_size and current_hop < 5:
             current_hop += 1
-            subset, _, _, _ = k_hop_subgraph(node_idx=i, num_hops=current_hop,
+            subset, _, _, _ = k_hop_subgraph(node_idx=index, num_hops=current_hop,
                                              edge_index=data.edge_index)
 
         if len(subset) < smallest_size:
-            need_node_num = smallest_size - len(subset)
-            pos_nodes = torch.argwhere(data.y == int(current_label))
+            pos_nodes = torch.where(data.y == int(current_label))[0]
             pos_nodes = pos_nodes.to('cpu')
             subset = subset.to('cpu')
             candidate_nodes = torch.from_numpy(np.setdiff1d(pos_nodes.numpy(), subset.numpy()))
-            candidate_nodes = candidate_nodes[torch.randperm(candidate_nodes.shape[0])][0:need_node_num]
-            subset = torch.cat([torch.flatten(subset), torch.flatten(candidate_nodes)])
+            candidate_nodes = candidate_nodes[torch.randperm(candidate_nodes.size(0))[:smallest_size - len(subset)]]
+            subset = torch.cat([subset, candidate_nodes])
 
         if len(subset) > largest_size:
-            subset = subset[torch.randperm(subset.shape[0])][0:largest_size - 1]
-            subset = torch.unique(torch.cat([torch.LongTensor([i]).to(device), torch.flatten(subset)]))
+            subset = subset.to('cpu')
+            subset = subset[torch.randperm(subset.size(0))[:largest_size - 1]]
+            subset = torch.unique(torch.cat([torch.tensor([index]), subset]))
 
         subset = subset.to(device)
         sub_edge_index, _ = subgraph(subset, data.edge_index, relabel_nodes=True)
         sub_edge_index = sub_edge_index.to(device)
-
         x = data.x[subset]
 
-        induced_graph = Data(x=x, edge_index=sub_edge_index, y=current_label, index=i)
-        induced_graph_list.append(induced_graph)
-    return Batch.from_data_list(induced_graph_list)
+        induced_graph = Data(x=x, edge_index=sub_edge_index, y=current_label, index=index)
+        file_path = os.path.join(dir_path, f'subgraph_{index}.pkl')
+        with open(file_path, 'wb') as f:
+            pickle.dump(induced_graph, f)
+        print(file_path)
+        if index % 500 == 0:
+            print(f"Processed {index} nodes")
 
+    print("Subgraphs saved successfully.")
 
-def load_induced_graph(dataset_name, data, device):
-    folder_path = './Experiment/induced_graph/' + dataset_name
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-
-    file_path = folder_path + '/induced_graph.pkl'
-    if os.path.exists(file_path):
+def load_induced_graphs(node_ids, dataset):
+    subgraphs = []
+    for node_id in node_ids:
+        file_path = './Experiment/induced_graph/'+ dataset + f'/subgraph_{node_id}.pkl'
         with open(file_path, 'rb') as f:
-            print('loading induced graph...')
-            graphs_list = pickle.load(f)
-            print('Done!!!')
-    else:
-        print('Begin split_induced_graphs.')
-        split_induced_graphs(data, folder_path, device, smallest_size=10, largest_size=30)
-        with open(file_path, 'rb') as f:
-            graphs_list = pickle.load(f)
-    graphs_list = [graph.to(device) for graph in graphs_list]
-    return graphs_list
+            subgraph = pickle.load(f)
+            subgraphs.append(subgraph)
+    return subgraphs
+
 
 def load_npz_to_sparse_graph(file_name):
     """Load a SparseGraph from a Numpy binary file.
@@ -364,4 +357,22 @@ def euclidean_dist(x, y):
     y = y.unsqueeze(0).expand(n, m, d)
 
     return torch.pow(x - y, 2).sum(2)  # N x M
+
+
+def cosine_dist(x, y):
+    # x: N x D query
+    # y: M x D prototype
+
+    # Normalize the prototypes and queries to unit vectors
+    y = F.normalize(y, p=2, dim=1)  # Shape: [num_classes, embedding_dim]
+    x = F.normalize(x, p=2, dim=1)  # Shape: [num_queries, embedding_dim]
+
+    # Compute cosine similarity
+    # Resulting shape will be [num_queries, num_classes]
+    cosine_similarity = torch.matmul(x, y.T)  # [50, 5]
+
+    # If you need cosine distance (1 - cosine similarity)
+    cosine_distance = 1 - cosine_similarity
+
+    return cosine_distance  # N x M
 

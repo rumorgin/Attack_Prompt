@@ -75,13 +75,13 @@ class GCN(torch.nn.Module):
             node_emb = torch.sum(torch.cat(h_list[1:], dim=0), dim=0)[0]
         
         if batch == None:
-            node_emb = F.normalize(node_emb)
+            # node_emb = F.normalize(node_emb)
             return node_emb
         else:
             if prompt_type == 'Gprompt':
                 node_emb = prompt(node_emb)
             node_emb = self.pool(node_emb, batch.long())
-            node_emb = F.normalize(node_emb)
+            # node_emb = F.normalize(node_emb)
             return node_emb
 
 

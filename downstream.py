@@ -29,6 +29,7 @@ if __name__ == '__main__':
     parser.add_argument('--qry', type=int, help='k shot for query set', default=10)
     parser.add_argument('--dataset', default='cora-full',
                         help='Dataset:Amazon_clothing/Amazon_eletronics/dblp/cora-full')
+    parser.add_argument('--split_induced_graph', type=bool, default=False, help='split induced graph or not')
     parser.add_argument('--pretrain', type=bool, default=True, help='copy the pretrained model parameters or not')
 
     args = parser.parse_args()
@@ -46,7 +47,12 @@ if __name__ == '__main__':
 
     data = data.to(device)
 
-    # graphs_list = load_induced_graph(args.dataset, data, device='cuda:0')
+    if args.split_induced_graph:
+        folder_path = './Experiment/induced_graph/' + args.dataset
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+            split_induced_graphs(data, folder_path, device, smallest_size=10, largest_size=30)
+
 
     # encoder = Encoder(in_channels=features.shape[1], hidden_channels=args.hidden)
     encoder = GCN(input_dim=data.x.shape[1], hid_dim=args.hidden, out_dim=None, num_layer=2, JK="last", drop_ratio=0,
@@ -57,8 +63,7 @@ if __name__ == '__main__':
                 torch.load('./pre_trained_gnn/cora-full/SimGRACE.GCN.128hidden_dim.pth', map_location='cuda:0'))
             print("Successfully loaded pre-trained weights!")
 
-    answering = torch.nn.Sequential(torch.nn.Linear(args.hidden, data.num_classes),
-                                    torch.nn.Softmax(dim=1)).to(device)
+    answering = torch.nn.Sequential(torch.nn.Linear(args.hidden, args.hidden)).to(device)
 
     prompt = HeavyPrompt(token_dim=data.num_features, token_num=10, cross_prune=0.1, inner_prune=0.3).to(device)
 
@@ -66,7 +71,7 @@ if __name__ == '__main__':
     optimizer_encoder = optim.Adam(encoder.parameters(),
                                    lr=args.lr, weight_decay=args.weight_decay)
     optimizer_prompt = optim.Adam(prompt.parameters(), lr=1e-6, weight_decay=args.weight_decay)
-    optimizer_answering = optim.Adam(answering.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # optimizer_answering = optim.Adam(answering.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     n_way = args.way
     k_shot = args.shot
@@ -92,25 +97,36 @@ if __name__ == '__main__':
         id_support, id_query, class_selected = \
             task_generator(id_by_class, class_list_train, n_way, k_shot, n_query)
 
-        support_induced_graph = split_induced_graphs(data,id_support, device, smallest_size=10, largest_size=30)
+        # Load subgraphs for support and query sets
+        support_subgraphs = load_induced_graphs(id_support,args.dataset)
+        query_subgraphs = load_induced_graphs(id_query,args.dataset)
 
-        query_induced_graph = split_induced_graphs(data,id_query, device, smallest_size=10, largest_size=30)
+        # Batch the subgraphs
+        support_batch = Batch.from_data_list(support_subgraphs).to(device)
+        query_batch = Batch.from_data_list(query_subgraphs).to(device)
 
         # answering.train()
         encoder.train()
 
         optimizer_encoder.zero_grad()
-        optimizer_answering.zero_grad()
+        # optimizer_answering.zero_grad()
 
-        support_embeddings = encoder(support_induced_graph.x, support_induced_graph.edge_index, support_induced_graph.batch)
+        support_embeddings = encoder(support_batch.x, support_batch.edge_index, support_batch.batch)
         z_dim = support_embeddings.size()[1]
+        # support_embeddings = answering(support_embeddings)
+
         support_embeddings = support_embeddings.view([n_way, k_shot, z_dim])
 
-        query_embeddings = encoder(query_induced_graph.x, query_induced_graph.edge_index,query_induced_graph.batch)
+        query_embeddings = encoder(query_batch.x, query_batch.edge_index,query_batch.batch)
+
+        # query_embeddings = answering(query_embeddings)
 
         # compute loss
         prototype_embeddings = support_embeddings.sum(1)
-        dists = euclidean_dist(query_embeddings, prototype_embeddings)
+
+        dists = cosine_dist(query_embeddings, prototype_embeddings)
+
+        # dists = euclidean_dist(query_embeddings, prototype_embeddings)
         output = F.log_softmax(-dists, dim=1)
 
         labels_new = torch.LongTensor([class_selected.index(i) for i in data.y[id_query]])
@@ -120,6 +136,7 @@ if __name__ == '__main__':
 
         loss_train.backward()
         optimizer_encoder.step()
+        # optimizer_answering.step()
 
         if args.use_cuda:
             output = output.cpu().detach()
@@ -149,28 +166,34 @@ if __name__ == '__main__':
             for idx in range(meta_test_num):
                 id_support, id_query, class_selected = test_pool[idx]
 
-                support_induced_graph = split_induced_graphs(data, id_support, device, smallest_size=10,
-                                                             largest_size=30)
+                # Load subgraphs for support and query sets
+                support_subgraphs = load_induced_graphs(id_support, args.dataset)
+                query_subgraphs = load_induced_graphs(id_query, args.dataset)
 
-                query_induced_graph = split_induced_graphs(data, id_query, device, smallest_size=10, largest_size=30)
+                # Batch the subgraphs
+                support_batch = Batch.from_data_list(support_subgraphs).to(device)
+                query_batch = Batch.from_data_list(query_subgraphs).to(device)
 
-                # answering.train()
+                # answering.eval()
                 encoder.eval()
 
-                optimizer_encoder.zero_grad()
-                optimizer_answering.zero_grad()
 
-                support_embeddings = encoder(support_induced_graph.x, support_induced_graph.edge_index,
-                                             support_induced_graph.batch)
+                support_embeddings = encoder(support_batch.x, support_batch.edge_index, support_batch.batch)
                 z_dim = support_embeddings.size()[1]
+                # support_embeddings = answering(support_embeddings)
+
                 support_embeddings = support_embeddings.view([n_way, k_shot, z_dim])
 
-                query_embeddings = encoder(query_induced_graph.x, query_induced_graph.edge_index,
-                                           query_induced_graph.batch)
+                query_embeddings = encoder(query_batch.x, query_batch.edge_index, query_batch.batch)
+
+                # query_embeddings = answering(query_embeddings)
 
                 # compute loss
                 prototype_embeddings = support_embeddings.sum(1)
-                dists = euclidean_dist(query_embeddings, prototype_embeddings)
+
+                dists = cosine_dist(query_embeddings, prototype_embeddings)
+
+                # dists = euclidean_dist(query_embeddings, prototype_embeddings)
                 output = F.log_softmax(-dists, dim=1)
 
                 labels_new = torch.LongTensor([class_selected.index(i) for i in data.y[id_query]])
