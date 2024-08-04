@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch, Data
 from sklearn.cluster import KMeans
 from torch_geometric.nn.inits import glorot
-
+from utils import cosine_dist
 
 class LightPrompt(torch.nn.Module):
     def __init__(self, token_dim, token_num_per_group, group_num=1, inner_prune=None):
@@ -98,25 +98,37 @@ class HeavyPrompt(LightPrompt):
         graphp_batch = Batch.from_data_list(re_graph_list)
         return graphp_batch
 
-    def Tune(self, train_loader, gnn, answering, lossfn, opi, device):
+    def Tune(self, data, gnn, answering, opi, device, args):
         running_loss = 0.
-        for batch_id, train_batch in enumerate(train_loader):
-            opi.zero_grad()
-            # print(train_batch)
-            train_batch = train_batch.to(device)
-            prompted_graph = self.forward(train_batch)
-            # print(prompted_graph)
+        opi.zero_grad()
+        # print(train_batch)
 
-            graph_emb = gnn(prompted_graph.x, prompted_graph.edge_index, prompted_graph.batch)
-            pre = answering(graph_emb)
-            train_loss = lossfn(pre, train_batch.y)
-            train_loss.backward()
-            opi.step()
-            running_loss += train_loss.item()
+        prompted_graph = self.forward(data)
+        # print(prompted_graph)
 
-            print(' batch {}/{} | loss: {:.8f}'.format(batch_id, len(train_loader), train_loss))
+        graph_emb = gnn(prompted_graph.x, prompted_graph.edge_index, prompted_graph.batch)
+        # graph_emb = answering(graph_emb)
 
-        return running_loss / len(train_loader)
+        # Split embeddings into support and query sets
+        support_embeddings = graph_emb[:args.way*args.shot]  # First 25 correspond to support set
+        query_embeddings = graph_emb[args.way*args.shot:]  # Last 50 correspond to query set
+        # Compute prototypes (mean of support embeddings per class)
+        prototypes = support_embeddings.view(args.way, args.shot, -1).mean(dim=1)  # Shape: [5, embedding_dim]
+
+        dists = cosine_dist(query_embeddings, prototypes)
+        output = F.log_softmax(-dists, dim=1)
+
+        labels_new = torch.arange(args.way).repeat_interleave(args.qry).to(device)
+
+        train_loss = F.nll_loss(output, labels_new)
+
+        train_loss.backward()
+        opi.step()
+        running_loss += train_loss.item()
+
+        # print(' loss: {:.8f}'.format( train_loss))
+
+        return output, running_loss
 
     def TuneWithoutAnswering(self, train_loader, gnn, answering, lossfn, opi, device):
         total_loss = 0.0

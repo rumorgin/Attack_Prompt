@@ -3,10 +3,11 @@ import time
 
 import torch.optim as optim
 
-from AllInOnePrompt import HeavyPrompt
+from GPF import GPF
 from GCN import GCN
-from GPN import *
 from utils import *
+from SupConLoss import SupConLoss
+
 
 if __name__ == '__main__':
     # Training settings
@@ -31,7 +32,7 @@ if __name__ == '__main__':
                         help='Dataset:Amazon_clothing/Amazon_eletronics/dblp/cora-full')
     parser.add_argument('--split_induced_graph', type=bool, default=False, help='split induced graph or not')
     parser.add_argument('--pretrain', type=bool, default=True, help='copy the pretrained model parameters or not')
-
+    parser.add_argument('--inner_step', type=int, default=5, help='inner step')
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -53,25 +54,23 @@ if __name__ == '__main__':
             os.makedirs(folder_path)
             split_induced_graphs(data, folder_path, device, smallest_size=10, largest_size=30)
 
-
     # encoder = Encoder(in_channels=features.shape[1], hidden_channels=args.hidden)
     encoder = GCN(input_dim=data.x.shape[1], hid_dim=args.hidden, out_dim=None, num_layer=2, JK="last", drop_ratio=0,
                   pool='mean').to(device)
     if args.pretrain:
         if args.dataset == 'cora-full':
             encoder.load_state_dict(
-                torch.load('./pre_trained_gnn/cora-full/SimGRACE.GCN.128hidden_dim.pth', map_location='cuda:0'))
+                torch.load('./pre_trained_gnn/cora-full/SimGRACE.GCN.128hidden_dim.pth', map_location='cpu'))
             print("Successfully loaded pre-trained weights!")
 
-    answering = torch.nn.Sequential(torch.nn.Linear(args.hidden, args.hidden)).to(device)
+    answering = torch.nn.Sequential(torch.nn.Linear(args.hidden, args.way)).to(device)
 
-    prompt = HeavyPrompt(token_dim=data.num_features, token_num=10, cross_prune=0.1, inner_prune=0.3).to(device)
-
+    prompt = GPF(data.x.shape[1]).to(device)
 
     optimizer_encoder = optim.Adam(encoder.parameters(),
                                    lr=args.lr, weight_decay=args.weight_decay)
-    optimizer_prompt = optim.Adam(prompt.parameters(), lr=1e-6, weight_decay=args.weight_decay)
-    # optimizer_answering = optim.Adam(answering.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer_prompt = optim.Adam(prompt.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer_answering = optim.Adam(answering.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     n_way = args.way
     k_shot = args.shot
@@ -98,53 +97,58 @@ if __name__ == '__main__':
             task_generator(id_by_class, class_list_train, n_way, k_shot, n_query)
 
         # Load subgraphs for support and query sets
-        support_subgraphs = load_induced_graphs(id_support,args.dataset)
-        query_subgraphs = load_induced_graphs(id_query,args.dataset)
+        support_subgraphs = load_induced_graphs(id_support, args.dataset)
+        query_subgraphs = load_induced_graphs(id_query, args.dataset)
 
-        # Batch the subgraphs
+        # Concatenate support and query DataBatches
         support_batch = Batch.from_data_list(support_subgraphs).to(device)
         query_batch = Batch.from_data_list(query_subgraphs).to(device)
 
-        # answering.train()
-        encoder.train()
+        prompt.train()
+        total_loss = 0.0
+        original_film_params = {name: param.clone() for name, param in prompt.named_parameters()}
 
-        optimizer_encoder.zero_grad()
-        # optimizer_answering.zero_grad()
+        for _ in range(args.inner_step):
+            inner_optimizer = torch.optim.Adam(prompt.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            inner_optimizer.zero_grad()
 
+            embeddings = encoder(support_batch.x, support_batch.edge_index, support_batch.batch)
+            prompt_embedding = prompt.add(support_batch.x)
+            film_embeddings = encoder(prompt_embedding, support_batch.edge_index, support_batch.batch)
+
+            features = torch.stack([embeddings, film_embeddings], dim=1)
+            # labels = torch.cat((support_batch.y,support_batch.y),dim=0)
+            criterion = SupConLoss()
+            loss = criterion(features, support_batch.y)
+            loss.backward()
+            inner_optimizer.step()
+
+        # Outer loop optimization
+        outer_optimizer = torch.optim.Adam(prompt.parameters(), lr=args.lr)
+
+        query_batch.x = prompt.add(query_batch.x)
+        query_graph_emb = encoder(query_batch.x, query_batch.edge_index, query_batch.batch)
+        query_labels = torch.arange(args.way).repeat_interleave(args.qry).to(device)
+
+        support_batch.x = prompt.add(support_batch.x)
         support_embeddings = encoder(support_batch.x, support_batch.edge_index, support_batch.batch)
-        z_dim = support_embeddings.size()[1]
-        # support_embeddings = answering(support_embeddings)
-
-        support_embeddings = support_embeddings.view([n_way, k_shot, z_dim])
-
-        query_embeddings = encoder(query_batch.x, query_batch.edge_index,query_batch.batch)
-
-        # query_embeddings = answering(query_embeddings)
-
-        # compute loss
+        support_embeddings = support_embeddings.view([n_way, k_shot, -1])
         prototype_embeddings = support_embeddings.sum(1)
 
-        dists = cosine_dist(query_embeddings, prototype_embeddings)
+        dists = cosine_dist(query_graph_emb, prototype_embeddings)
 
         # dists = euclidean_dist(query_embeddings, prototype_embeddings)
         output = F.log_softmax(-dists, dim=1)
 
-        labels_new = torch.LongTensor([class_selected.index(i) for i in data.y[id_query]])
-        if args.use_cuda:
-            labels_new = labels_new.cuda()
-        loss_train = F.nll_loss(output, labels_new)
+        query_loss = F.nll_loss(output, query_labels)
 
-        loss_train.backward()
-        optimizer_encoder.step()
-        # optimizer_answering.step()
+        acc_train = accuracy(output, query_labels)
+        meta_train_acc.append(acc_train.cpu().detach())
+        meta_train_loss.append(query_loss.cpu().detach())
 
-        if args.use_cuda:
-            output = output.cpu().detach()
-            labels_new = labels_new.cpu().detach()
-        acc_train = accuracy(output, labels_new)
-        f1_train = f1(output, labels_new)
-        meta_train_acc.append(acc_train)
-        meta_train_loss.append(loss_train.cpu().detach())
+        query_loss.backward()
+        optimizer_prompt.step()
+
         if episode > 0 and episode % 10 == 0:
             print("-------Episode {}-------".format(episode))
             print("Meta-Train_Accuracy: {}  Meta-Train_Loss: {}".format(np.array(meta_train_acc).mean(axis=0),
@@ -163,51 +167,44 @@ if __name__ == '__main__':
             # testing
             meta_test_acc = []
             meta_test_f1 = []
-            for idx in range(meta_test_num):
-                id_support, id_query, class_selected = test_pool[idx]
+            with torch.no_grad():
+                for idx in range(meta_test_num):
+                    id_support, id_query, class_selected = test_pool[idx]
 
-                # Load subgraphs for support and query sets
-                support_subgraphs = load_induced_graphs(id_support, args.dataset)
-                query_subgraphs = load_induced_graphs(id_query, args.dataset)
+                    # Load subgraphs for support and query sets
+                    support_subgraphs = load_induced_graphs(id_support, args.dataset)
+                    query_subgraphs = load_induced_graphs(id_query, args.dataset)
 
-                # Batch the subgraphs
-                support_batch = Batch.from_data_list(support_subgraphs).to(device)
-                query_batch = Batch.from_data_list(query_subgraphs).to(device)
+                    # Concatenate support and query DataBatches
+                    combined_batch = Batch.from_data_list(support_subgraphs + query_subgraphs).to(device)
 
-                # answering.eval()
-                encoder.eval()
+                    prompt.train()
+                    total_loss = 0.0
 
+                    optimizer_prompt.zero_grad()
+                    combined_batch.x = prompt.add(combined_batch.x)
+                    graph_emb = encoder(combined_batch.x, combined_batch.edge_index, combined_batch.batch)
 
-                support_embeddings = encoder(support_batch.x, support_batch.edge_index, support_batch.batch)
-                z_dim = support_embeddings.size()[1]
-                # support_embeddings = answering(support_embeddings)
+                    # Split embeddings into support and query sets
+                    support_embeddings = graph_emb[:args.way * args.shot]  # First 25 correspond to support set
+                    query_embeddings = graph_emb[args.way * args.shot:]  # Last 50 correspond to query set
+                    # Compute prototypes (mean of support embeddings per class)
+                    prototypes = support_embeddings.view(args.way, args.shot, -1).mean(
+                        dim=1)  # Shape: [5, embedding_dim]
 
-                support_embeddings = support_embeddings.view([n_way, k_shot, z_dim])
+                    dists = cosine_dist(query_embeddings, prototypes)
+                    output = F.log_softmax(-dists, dim=1)
 
-                query_embeddings = encoder(query_batch.x, query_batch.edge_index, query_batch.batch)
+                    labels_new = torch.arange(args.way).repeat_interleave(args.qry).to(device)
 
-                # query_embeddings = answering(query_embeddings)
+                    if args.use_cuda:
+                        output = output.cpu().detach()
+                        labels_new = labels_new.cpu().detach()
+                    acc_train = accuracy(output, labels_new)
+                    f1_train = f1(output, labels_new)
+                    meta_test_acc.append(acc_train)
+                    meta_test_f1.append(f1_train)
 
-                # compute loss
-                prototype_embeddings = support_embeddings.sum(1)
-
-                dists = cosine_dist(query_embeddings, prototype_embeddings)
-
-                # dists = euclidean_dist(query_embeddings, prototype_embeddings)
-                output = F.log_softmax(-dists, dim=1)
-
-                labels_new = torch.LongTensor([class_selected.index(i) for i in data.y[id_query]])
-                if args.use_cuda:
-                    labels_new = labels_new.cuda()
-                loss_test = F.nll_loss(output, labels_new)
-
-                if args.use_cuda:
-                    output = output.cpu().detach()
-                    labels_new = labels_new.cpu().detach()
-                acc_test = accuracy(output, labels_new)
-                f1_test = f1(output, labels_new)
-                meta_test_acc.append(acc_test)
-                meta_test_f1.append(f1_test)
 
             # Calculate the mean accuracy and F1 score for the current test
             mean_test_acc = np.array(meta_test_acc).mean(axis=0)
